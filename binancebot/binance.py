@@ -1,4 +1,4 @@
-from typing import Any, List, Literal, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Mapping, MutableMapping, Sequence, Tuple
 
 import asyncio
 import enum
@@ -70,7 +70,7 @@ class OrderBook:
 
 
 class BinanceClient(trader.TradingClient):
-    def __init__(self, api_base, api_key, secret_key, http_client): 
+    def __init__(self, api_base, api_key, secret_key, http_client):
         self.api_base = api_base
         self.api_key = api_key
         self.secret_key = secret_key
@@ -78,7 +78,7 @@ class BinanceClient(trader.TradingClient):
         self.symbols = {}
         self.symbols_last_fetched = 0
 
-    # -------------------- 
+    # --------------------
     # TraderClient API
     # --------------------
 
@@ -126,6 +126,7 @@ class BinanceClient(trader.TradingClient):
         quote_quantity: trader.Quantity = None,
     ) -> trader.OrderInfo:
         symbol = await self.get_symbol(base, quote)
+        params: Dict[str, Any]
         params = dict(
             symbol=symbol,
             side=OrderSide.BUY.value,
@@ -164,6 +165,7 @@ class BinanceClient(trader.TradingClient):
         quote_quantity: trader.Quantity = None,
     ) -> trader.OrderInfo:
         symbol = await self.get_symbol(base, quote)
+        params: Dict[str, Any]
         params = dict(
             symbol=symbol,
             side=OrderSide.SELL.value,
@@ -250,7 +252,7 @@ class BinanceClient(trader.TradingClient):
             status=trader.OrderStatus(response_json["status"]),
         )
 
-    # -------------------- 
+    # --------------------
     # Additional info
     # --------------------
 
@@ -279,7 +281,7 @@ class BinanceClient(trader.TradingClient):
                 limit=1000
             ),
         )
-        
+
         return [
             Candlestick(
                 open_time=c[0],
@@ -301,15 +303,15 @@ class BinanceClient(trader.TradingClient):
         # numerically stable rolling weighted mean
         vwap = (candlesticks[-1].close + candlesticks[-1].high + candlesticks[-1].low) / 3
         volume = candlesticks[-1].volume
-        for c in candlesticks[-2 :: -1]:
+        for c in candlesticks[-2::-1]:
             volume += c.volume
             if volume > 0:
                 vwap += ((c.close + c.high + c.low) / 3 - vwap) * c.volume / volume
 
         return vwap
 
-    # -------------------- 
-    # Utility methods 
+    # --------------------
+    # Utility methods
     # --------------------
 
     async def get_symbol(self, base: trader.Asset, quote: trader.Asset) -> Symbol:
@@ -332,8 +334,8 @@ class BinanceClient(trader.TradingClient):
         self,
         endpoint: str,
         *,
-        params: MutableMapping = None,
-        headers: MutableMapping = None,
+        params: MutableMapping[str, Any] = None,
+        headers: MutableMapping[str, Any] = None,
         signed: bool = False,
         method: Literal["get", "post"] = "get",
     ) -> Any:

@@ -1,4 +1,4 @@
-from typing import List, Mapping, Sequence, Tuple
+from typing import Dict, List, Mapping, Tuple
 
 import decimal
 
@@ -9,8 +9,8 @@ from binancebot import trader
 
 class PlatonicMarket(trader.TradingClient):
     """An ideal market where all orders are immediately filled at the given price."""
-    holdings: Mapping[trader.Asset, trader.Quantity]
-    prices: Mapping[Tuple[trader.Asset, trader.Asset], trader.Price]
+    holdings: Dict[trader.Asset, trader.Quantity]
+    prices: Dict[Tuple[trader.Asset, trader.Asset], trader.Price]
     commission: float
     orders: List[trader.OrderInfo]
 
@@ -27,7 +27,7 @@ class PlatonicMarket(trader.TradingClient):
         return self.prices[base, quote]
 
     async def get_order_info(self, order_id: int) -> trader.OrderInfo:
-        return orders[order_id]
+        return self.orders[order_id]
 
     async def buy_at_market(
         self,
@@ -46,6 +46,9 @@ class PlatonicMarket(trader.TradingClient):
             quote_quantity = base_quantity * price
         elif quote_quantity:
             base_quantity = quote_quantity / price
+
+        assert base_quantity is not None
+        assert quote_quantity is not None
 
         executed_quantity = base_quantity * decimal.Decimal(1 - self.commission)
         cumulative_quote_quantity = quote_quantity
@@ -90,6 +93,9 @@ class PlatonicMarket(trader.TradingClient):
             quote_quantity = base_quantity * price
         elif quote_quantity:
             base_quantity = quote_quantity / price
+
+        assert base_quantity is not None
+        assert quote_quantity is not None
 
         executed_quantity = base_quantity
         cumulative_quote_quantity = quote_quantity * decimal.Decimal(1 - self.commission)
@@ -144,7 +150,7 @@ class PlatonicMarket(trader.TradingClient):
 
         self.orders.append(status)
         return status
-        
+
     async def sell_at(self, base: trader.Asset, quote: trader.Asset, price: trader.Price, base_quantity: trader.Quantity) -> trader.OrderInfo:
         quote_quantity = base_quantity * price
         executed_quantity = base_quantity

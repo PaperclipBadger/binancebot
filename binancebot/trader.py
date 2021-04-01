@@ -1,12 +1,10 @@
 from typing import Any, Mapping
- 
+
 import asyncio
 import enum
 import dataclasses
 import decimal
 import math
-
-import httpx
 
 
 Asset = str
@@ -77,13 +75,13 @@ class TradingClient:
 
     async def buy_at(self, base: Asset, quote: Asset, price: Price, base_quantity: Quantity) -> OrderInfo:
         ...
-        
+
     async def sell_at(self, base: Asset, quote: Asset, price: Price, base_quantity: Quantity) -> OrderInfo:
         ...
 
 
 async def rebalance(
-    target: Mapping[Asset, float], 
+    target: Mapping[Asset, float],
     value_asset: Asset,
     quote_asset: Asset,
     threshold: float,
@@ -91,7 +89,7 @@ async def rebalance(
 ) -> None:
     assert abs(sum(target.values()) - 1.0) < 1.e-12
 
-    holdings = await client.get_holdings()
+    holdings = dict(await client.get_holdings())
     base_assets = set(target) | set(holdings)
 
     pairs = [
@@ -155,7 +153,7 @@ async def rebalance(
     # While the portfolio is underbalanced, sell the most overrepresented asset
     # in exchange for the most underrepresented asset such that one or the other
     # become perfectly represented.
-    # This way we rebalance using at most len(holdings) + len(target) trades, 
+    # This way we rebalance using at most len(holdings) + len(target) trades,
     # since at every step of the loop we balance some asset.
     log_threshold = math.log(threshold)
 
@@ -221,8 +219,8 @@ async def buy_via(base, quote, via, base_quantity, client) -> None:
             while sell_order.status.is_open:
                 await asyncio.sleep(0.5)
                 sell_order = await client.get_order_info(result.order_id)
-                
-            via_quantity = order.cumulative_quote_quantity
+
+            via_quantity = sell_order.cumulative_quote_quantity
         else:
             via_quantity = sell_result.cumulative_quote_quantity
 

@@ -2,7 +2,6 @@ from typing import Awaitable, Callable, Type
 
 import asyncio
 import itertools
-import contextlib
 
 import httpx
 
@@ -72,5 +71,5 @@ main = loop.create_task(
 )
 loop.run_until_complete(main)
 
-cleanup = loop.create_task(asyncio.gather(client.aclose(), server.stop()))
+cleanup = loop.create_task(asyncio.gather(http_client.aclose(), server.stop()))
 loop.run_until_complete(cleanup)
