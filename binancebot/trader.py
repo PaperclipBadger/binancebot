@@ -1,10 +1,14 @@
-from typing import Any, Mapping
+from typing import Mapping, Sequence
 
 import asyncio
 import enum
 import dataclasses
 import decimal
+import logging
 import math
+
+
+logger = logging.getLogger(__name__)
 
 
 Asset = str
@@ -17,30 +21,31 @@ class OrderSide(enum.Enum):
     SELL = "SELL"
 
 
-class OrderStatus(enum.Enum):
-    NEW = "NEW"
-    PARTIALLY_FILLED = "PARTIALLY_FILLED"
-    FILLED = "FILLED"
-    CANCELED = "CANCELED"
-    PENDING_CANCEL = "PENDING_CANCEL"
-    REJECTED = "REJECTED"
-    EXPIRED = "EXPIRED"
-
-    @property
-    def is_open(self):
-        return self in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)
+@dataclasses.dataclass(frozen=True)
+class Fill:
+    price: Price
+    base_quantity: Quantity
+    quote_quantity: Quantity
 
 
 @dataclasses.dataclass(frozen=True)
-class OrderInfo:
-    order_id: Any
+class ExecutedOrder:
     base: Asset
     quote: Asset
     side: OrderSide
-    original_quantity: Quantity
-    executed_quantity: Quantity
-    cumulative_quote_quantity: Quantity
-    status: OrderStatus
+    fills: Sequence[Fill]
+
+    @property
+    def base_quantity(self):
+        return sum(fill.base_quantity for fill in self.fills)
+
+    @property
+    def quote_quantity(self):
+        return sum(fill.quote_quantity for fill in self.fills)
+
+
+class OrderError(ValueError):
+    pass
 
 
 class TradingClient:
@@ -50,9 +55,6 @@ class TradingClient:
     async def get_price(self, base: Asset, quote: Asset) -> Price:
         ...
 
-    async def get_order_info(self, order_id: Any) -> OrderInfo:
-        ...
-
     async def buy_at_market(
         self,
         base: Asset,
@@ -60,7 +62,7 @@ class TradingClient:
         *,
         base_quantity: Quantity = None,
         quote_quantity: Quantity = None,
-    ) -> OrderInfo:
+    ) -> ExecutedOrder:
         ...
 
     async def sell_at_market(
@@ -70,17 +72,18 @@ class TradingClient:
         *,
         base_quantity: Quantity = None,
         quote_quantity: Quantity = None,
-    ) -> OrderInfo:
+    ) -> ExecutedOrder:
         ...
 
-    async def buy_at(self, base: Asset, quote: Asset, price: Price, base_quantity: Quantity) -> OrderInfo:
+    async def buy_at(self, base: Asset, quote: Asset, price: Price, base_quantity: Quantity) -> ExecutedOrder:
         ...
 
-    async def sell_at(self, base: Asset, quote: Asset, price: Price, base_quantity: Quantity) -> OrderInfo:
+    async def sell_at(self, base: Asset, quote: Asset, price: Price, base_quantity: Quantity) -> ExecutedOrder:
         ...
 
 
 async def rebalance(
+    minima: Mapping[Asset, Quantity],
     target: Mapping[Asset, float],
     value_asset: Asset,
     quote_asset: Asset,
@@ -90,7 +93,8 @@ async def rebalance(
     assert abs(sum(target.values()) - 1.0) < 1.e-12
 
     holdings = dict(await client.get_holdings())
-    base_assets = set(target) | set(holdings)
+    logger.info(f"holdings: {holdings}")
+    base_assets = set(target) | set(holdings) | set(minima)
 
     pairs = [
         (base, quote)
@@ -106,23 +110,25 @@ async def rebalance(
     def get_price(base: Asset, quote: Asset) -> Price:
         if base == quote:
             return decimal.Decimal(1)
-        elif base == quote_asset:
-            return 1 / market[quote, quote_asset]
-        elif quote == quote_asset:
-            return market[base, quote_asset]
         elif base == value_asset:
             return 1 / market[quote, value_asset]
         elif quote == value_asset:
             return market[base, value_asset]
+        elif base == quote_asset:
+            return 1 / market[quote, quote_asset]
+        elif quote == quote_asset:
+            return market[base, quote_asset]
         else:
             return market[base, quote_asset] / market[quote, quote_asset]
 
-    def get_value(asset: Asset):
-        quantity = holdings.get(asset, 0)
+    def get_value(asset: Asset, quantity: Quantity = None) -> Quantity:
+        if quantity is None:
+            quantity = holdings.get(asset, Quantity(0))
+        assert quantity is not None
         return quantity * get_price(asset, value_asset)
 
     # value distribution of portfolio
-    all_assets = sorted(set(holdings) | set(target))
+    all_assets = sorted(set(holdings) | set(target) | set(minima))
     values = {asset: get_value(asset) for asset in all_assets}
     total = sum(values.values())
 
@@ -131,14 +137,40 @@ async def rebalance(
         for k, v in values.items()
     }
 
+    logger.info(f"current distribution: {', '.join('{}={:.3f}'.format(k, v) for k, v in distribution.items())}")
+
+    unreserved_assets = set(target)
+    unreserved_sum = 1.0
+
+    target_ = dict(target)
+
+    for asset in minima:
+        minimum_t = float(get_value(asset, minima.get(asset, Quantity(0))) / total)
+        t = target_.get(asset, 0.0)
+        if minimum_t > t:
+            assert unreserved_sum >= minimum_t
+
+            target_[asset] = minimum_t
+            unreserved_assets.discard(asset)
+            rescaler = (unreserved_sum - minimum_t) / (unreserved_sum - t)
+            for k in unreserved_assets:
+                target_[k] *= rescaler
+
+            unreserved_sum -= minimum_t
+
+    target = target_
+
     def delta(k: Asset) -> float:
-        if distribution[k] > 0 and k in target:
-            return math.log(distribution[k]) - math.log(target[k])
-        elif distribution[k] > 0 and k not in target:
+        has_holdings = distribution[k] > 0
+        has_target = k in target
+        if has_holdings and has_target:
+            return math.log(distribution[k]) - math.log(target.get(k, 0))
+        elif has_holdings and not has_target:
+            # if no target is set then target is implicitly zero
             return float("inf")
-        elif distribution[k] == 0 and k in target:
+        elif not has_holdings and has_target:
             return float("-inf")
-        elif distribution[k] == 0 and k not in target:
+        elif not has_holdings and not has_target:
             return 0.0
         else:
             assert False, "inconceivable!"
@@ -165,7 +197,6 @@ async def rebalance(
             decimal.Decimal(target[under]) - distribution[under],
             distribution[over] - decimal.Decimal(target.get(over, 0)),
         )
-
         over_quantity = holdings[over] * (recovered / distribution[over])
         under_quantity = over_quantity * get_price(under, over)
 
@@ -183,12 +214,18 @@ async def rebalance(
         by_allocation[-1] = delta(over), over
         by_allocation.sort()  # timsort, don't fail me now
 
-    await asyncio.gather(
+    # gather together like trades
+    results = await asyncio.gather(
         *(
             buy_via(sell, buy, quote_asset, base_quantity, client)
             for base_quantity, sell, buy in trades
-        )
+        ),
+        return_exceptions=True,
     )
+
+    for r in results:
+        if isinstance(r, BaseException):
+            logger.error(f"{r.__class__.__name__}: {r}")
 
 
 # do all trading via a quote asset, so we don't use any low-liquidity altcoin markets
@@ -196,42 +233,33 @@ async def buy_via(base, quote, via, base_quantity, client) -> None:
     assert base != quote
 
     if base == via:
-        result = await client.buy_at_market(
+        logger.debug("base==via, direct trade")
+        logger.info(f"trading {base_quantity} {base} for {quote}")
+        await client.buy_at_market(
             quote,
             base,
             quote_quantity=base_quantity,
         )
     elif via == quote:
-        result = client.sell_at_market(
+        logger.debug("via==quote, direct trade")
+        logger.info(f"trading {base_quantity} {base} for {quote}")
+        await client.sell_at_market(
             base,
             quote,
             base_quantity=base_quantity,
         )
     else:
+        logger.debug("indirect trade")
+        logger.info(f"trading {base_quantity} {base} for {via}")
         sell_result = await client.sell_at_market(
             base,
             via,
             base_quantity=base_quantity,
         )
-
-        if sell_result.status.is_open:
-            sell_order = await client.get_order_info(sell_result.order_id)
-            while sell_order.status.is_open:
-                await asyncio.sleep(0.5)
-                sell_order = await client.get_order_info(result.order_id)
-
-            via_quantity = sell_order.cumulative_quote_quantity
-        else:
-            via_quantity = sell_result.cumulative_quote_quantity
-
-        result = await client.buy_at_market(
+        via_quantity = sell_result.quote_quantity
+        logger.info(f"trading {via_quantity} {via} for {quote}")
+        await client.buy_at_market(
             quote,
             via,
             quote_quantity=via_quantity,
         )
-
-    if result.status.is_open:
-        order = await client.get_order_info(result.order_id)
-        while order.status.is_open:
-            await asyncio.sleep(0.5)
-            order = await client.get_order_info(result.order_id)
