@@ -4,7 +4,6 @@ import asyncio
 import dataclasses
 import enum
 import hmac
-import itertools
 import json
 import logging
 import time
@@ -164,6 +163,7 @@ class BinanceClient(trader.TradingClient):
         self.symbol_info = {}
         self.symbols = {}
         self.symbols_last_fetched = 0
+        self.symbols_lock = asyncio.Lock()
 
     # --------------------
     # TraderClient API
@@ -171,10 +171,11 @@ class BinanceClient(trader.TradingClient):
 
     async def get_holdings(self) -> Mapping[trader.Asset, trader.Quantity]:
         response_json = await self.binance_rest("/api/v3/account", signed=True)
+        logger.debug(response_json)
         return {
-            balance["asset"]: trader.Quantity(balance["free"])
+            balance["asset"]: trader.Quantity(balance["free"]) + trader.Quantity(balance["locked"])
             for balance in response_json["balances"]
-            if trader.Quantity(balance["free"]) > 0
+            if trader.Quantity(balance["free"]) + trader.Quantity(balance["locked"]) > 0
         }
 
     async def get_price(self, base: trader.Asset, quote: trader.Asset) -> trader.Price:
@@ -182,52 +183,21 @@ class BinanceClient(trader.TradingClient):
         response_json = await self.binance_rest("/api/v3/avgPrice", params={"symbol": symbol})
         return trader.Price(response_json['price'])
 
-    async def buy_at_market(
+    async def apply_market_filters(
         self,
         base: trader.Asset,
         quote: trader.Asset,
         *,
         base_quantity: trader.Quantity = None,
         quote_quantity: trader.Quantity = None,
-    ) -> trader.ExecutedOrder:
-        return await self.trade_at_market(
-            side=OrderSide.BUY,
-            base=base,
-            quote=quote,
-            base_quantity=base_quantity,
-            quote_quantity=quote_quantity,
-        )
-
-    async def sell_at_market(
-        self,
-        base: trader.Asset,
-        quote: trader.Asset,
-        *,
-        base_quantity: trader.Quantity = None,
-        quote_quantity: trader.Quantity = None,
-    ) -> trader.ExecutedOrder:
-        return await self.trade_at_market(
-            side=OrderSide.SELL,
-            base=base,
-            quote=quote,
-            base_quantity=base_quantity,
-            quote_quantity=quote_quantity,
-        )
-
-    async def trade_at_market(
-        self,
-        side: OrderSide,
-        base: trader.Asset,
-        quote: trader.Asset,
-        *,
-        base_quantity: trader.Quantity = None,
-        quote_quantity: trader.Quantity = None,
-    ) -> trader.ExecutedOrder:
+    ) -> List[trader.MarketOrder]:
+        """Returns the closest trade(s) that satisfies the filters."""
         assert base_quantity or quote_quantity
         assert not (base_quantity and quote_quantity)
 
+        market_price = await self.get_price(base, quote)
+
         if quote_quantity:
-            market_price = await self.get_price(base, quote)
             quantity = quote_quantity / market_price
         elif base_quantity:
             quantity = base_quantity
@@ -235,23 +205,40 @@ class BinanceClient(trader.TradingClient):
         symbol = await self.get_symbol(base, quote)
         symbol_info = await self.get_symbol_info(symbol)
 
+        if symbol_info.market_notional_value_filter is not None:
+            g = symbol_info.market_notional_value_filter
+            assert g is not None
+
+            logger.debug(f"notional: {base} {quote}")
+            logger.debug(f"notional: quantity in {quantity}")
+
+            # ignore window_minutes and just use get_price
+            if quantity * market_price < g.min:
+                quantity = g.min / market_price
+
+            logger.debug(f"notional: price {market_price}, min {g.min}")
+            logger.debug(f"notional: quantity out {quantity}")
+
         if symbol_info.market_lot_size_filter is None:
             splits = [quantity]
         else:
             f = symbol_info.market_lot_size_filter
             assert f is not None
 
+            def ceildiv(a, b):
+                return a // b + (1 if a % b > 0 else 0)
+
             if f.step and f.min:
-                quantity = ((quantity - f.min) // f.step) * f.step + f.min
+                quantity = ceildiv((quantity - f.min), f.step) * f.step + f.min
             elif f.step:
-                quantity = (quantity // f.step) * f.step
+                quantity = ceildiv(quantity, f.step) * f.step
 
             if f.min and quantity < f.min:
-                raise trader.OrderError(f"base quantity {quantity} is less than minimum {f.min}")
+                splits = [f.min]
             elif f.max and quantity > f.max:
                 # break into smaller, valid orders
                 if f.step:
-                    chunk_size = ((f.max / 2) // f.step) * f.step
+                    chunk_size = ceildiv(f.max / 2, f.step) * f.step
                 else:
                     chunk_size = f.max / 2
 
@@ -265,66 +252,35 @@ class BinanceClient(trader.TradingClient):
                 splits = [quantity]
 
         if quote_quantity:
-            results = await asyncio.gather(
-                *(
-                    self.submit_market_order(
-                        side=side,
-                        base=base,
-                        quote=quote,
-                        quote_quantity=round(
-                            (split / quantity) * quote_quantity,
-                            symbol_info.quote_precision,
-                        ),
-                    )
-                    for split in splits
+            return [
+                trader.MarketOrder(
+                    base=base,
+                    quote=quote,
+                    quote_quantity=round(
+                        (split / quantity) * quote_quantity,
+                        symbol_info.quote_precision,
+                    ),
                 )
-            )
+                for split in splits
+            ]
         else:
-            results = await asyncio.gather(
-                *(
-                    self.submit_market_order(
-                        side=side,
-                        base=base,
-                        quote=quote,
-                        base_quantity=round(split, symbol_info.base_precision),
-                    )
-                    for split in splits
+            return [
+                trader.MarketOrder(
+                    base=base,
+                    quote=quote,
+                    base_quantity=round(split, symbol_info.base_precision),
                 )
-            )
+                for split in splits
+            ]
 
-        return trader.ExecutedOrder(
-            base=base,
-            quote=quote,
-            side=trader.OrderSide(side.value),
-            fills=list(itertools.chain.from_iterable(result.fills for result in results)),
-        )
-
-    async def buy_at(self, base: trader.Asset, quote: trader.Asset, price: trader.Price, base_quantity: trader.Quantity) -> trader.ExecutedOrder:
-        return await self.trade_at(
-            side=OrderSide.BUY,
-            base=base,
-            quote=quote,
-            price=price,
-            base_quantity=base_quantity,
-        )
-
-    async def sell_at(self, base: trader.Asset, quote: trader.Asset, price: trader.Price, base_quantity: trader.Quantity) -> trader.ExecutedOrder:
-        return await self.trade_at(
-            side=OrderSide.SELL,
-            base=base,
-            quote=quote,
-            price=price,
-            base_quantity=base_quantity,
-        )
-
-    async def trade_at(
+    async def apply_limit_filters(
         self,
-        side: OrderSide,
         base: trader.Asset,
         quote: trader.Asset,
         price: trader.Price,
         base_quantity: trader.Quantity,
-    ) -> trader.ExecutedOrder:
+    ) -> List[trader.LimitOrder]:
+        """Returns the closest trade(s) that satisfies the filters."""
         symbol = await self.get_symbol(base, quote)
         symbol_info = await self.get_symbol_info(symbol)
 
@@ -334,13 +290,20 @@ class BinanceClient(trader.TradingClient):
             f = symbol_info.price_filter
             assert f is not None
             if f.min and price < f.min:
-                raise trader.OrderError(f"price {price} is less than minimum {f.min}")
-            elif f.max and price < f.max:
-                raise trader.OrderError(f"price {price} is greater than maximum {f.max}")
+                price = f.min
+            elif f.max and price > f.max:
+                price = f.max
             elif f.min and f.step:
                 price = ((price - f.min) // f.step) * f.step + f.min
             elif f.step:
                 price = (price // f.step) * f.step
+
+        if symbol_info.limit_notional_value_filter is not None:
+            g = symbol_info.limit_notional_value_filter
+            assert g is not None
+
+            if base_quantity * price < g.min:
+                base_quantity = g.min / price
 
         if symbol_info.limit_lot_size_filter is None:
             splits = [base_quantity]
@@ -355,7 +318,7 @@ class BinanceClient(trader.TradingClient):
                 quantity = (quantity // f_.step) * f_.step
 
             if f_.min and quantity < f_.min:
-                raise trader.OrderError(f"base quantity {quantity} is less than minimum {f_.min}")
+                splits = [f_.min]
             elif f_.max and quantity > f_.max:
                 # break into smaller, valid orders
                 if f_.step:
@@ -372,24 +335,66 @@ class BinanceClient(trader.TradingClient):
             else:
                 splits = [quantity]
 
-        results = await asyncio.gather(
-            *(
-                self.submit_limit_order(
-                    side=side,
-                    base=base,
-                    quote=quote,
-                    time_in_force=TimeInForce.IMMEDIATE_OR_CANCEL,
-                    price=price,
-                    base_quantity=split,
-                )
-                for split in splits
+        return [
+            trader.LimitOrder(
+                base=base,
+                quote=quote,
+                price=price,
+                base_quantity=round(split, symbol_info.base_precision),
             )
-        )
-        return trader.ExecutedOrder(
+            for split in splits
+        ]
+
+    async def buy_at_market(
+        self,
+        base: trader.Asset,
+        quote: trader.Asset,
+        *,
+        base_quantity: trader.Quantity = None,
+        quote_quantity: trader.Quantity = None,
+    ) -> trader.ExecutedOrder:
+        return await self.submit_market_order(
+            side=OrderSide.BUY,
             base=base,
             quote=quote,
-            side=trader.OrderSide(side.value),
-            fills=list(itertools.chain.from_iterable(result.fills for result in results)),
+            base_quantity=base_quantity,
+            quote_quantity=quote_quantity,
+        )
+
+    async def sell_at_market(
+        self,
+        base: trader.Asset,
+        quote: trader.Asset,
+        *,
+        base_quantity: trader.Quantity = None,
+        quote_quantity: trader.Quantity = None,
+    ) -> trader.ExecutedOrder:
+        return await self.submit_market_order(
+            side=OrderSide.SELL,
+            base=base,
+            quote=quote,
+            base_quantity=base_quantity,
+            quote_quantity=quote_quantity,
+        )
+
+    async def buy_at(self, base: trader.Asset, quote: trader.Asset, price: trader.Price, base_quantity: trader.Quantity) -> trader.ExecutedOrder:
+        return await self.submit_limit_order(
+            side=OrderSide.BUY,
+            base=base,
+            quote=quote,
+            price=price,
+            base_quantity=base_quantity,
+            time_in_force=TimeInForce.IMMEDIATE_OR_CANCEL,
+        )
+
+    async def sell_at(self, base: trader.Asset, quote: trader.Asset, price: trader.Price, base_quantity: trader.Quantity) -> trader.ExecutedOrder:
+        return await self.submit_limit_order(
+            side=OrderSide.SELL,
+            base=base,
+            quote=quote,
+            price=price,
+            base_quantity=base_quantity,
+            time_in_force=TimeInForce.IMMEDIATE_OR_CANCEL,
         )
 
     async def submit_limit_order(
@@ -574,120 +579,123 @@ class BinanceClient(trader.TradingClient):
 
     async def get_symbols(self) -> Mapping[Tuple[trader.Asset, trader.Asset], Symbol]:
         """Fetch the list of active symbols."""
-        if not self.symbols or now() - self.symbols_last_fetched > 3_600_000:
-            response_json = await self.binance_rest("/api/v3/exchangeInfo")
+        async with self.symbols_lock:
+            if not self.symbols or now() - self.symbols_last_fetched > 3_600_000:
+                response_json = await self.binance_rest("/api/v3/exchangeInfo")
 
-            self.symbol_info = {}
-            self.symbols = {}
+                logger.info(f"exchange time: {response_json['serverTime']} bot time: {now()}")
 
-            for s in response_json["symbols"]:
-                max_orders = None
-                max_position = None
-                price_filter = None
-                percent_price_filter = None
-                limit_lot_size_filter = None
-                limit_notional_value_filter = None
-                market_lot_size_filter = None
-                market_notional_value_filter = None
+                self.symbol_info = {}
+                self.symbols = {}
 
-                min_: Optional[trader.Quantity]
-                max_: Optional[trader.Quantity]
-                step: Optional[trader.Quantity]
+                for s in response_json["symbols"]:
+                    max_orders = None
+                    max_position = None
+                    price_filter = None
+                    percent_price_filter = None
+                    limit_lot_size_filter = None
+                    limit_notional_value_filter = None
+                    market_lot_size_filter = None
+                    market_notional_value_filter = None
 
-                for f in s["filters"]:
-                    if f["filterType"] == "PRICE_FILTER":
-                        min_p = trader.Price(f["minPrice"])
-                        max_p = trader.Price(f["maxPrice"])
-                        step_p = trader.Price(f["tickSize"])
-                        price_filter = PriceFilter(
-                            min=min_p if min_p else None,
-                            max=max_p if max_p else None,
-                            step=step_p if step_p else None,
-                        )
-                    elif f["filterType"] == "PERCENT_PRICE":
-                        percent_price_filter = PercentPriceFilter(
-                            multiplier_up=trader.Price(f["multiplierUp"]),
-                            multiplier_down=trader.Price(f["multiplierDown"]),
-                            window_minutes=f["avgPriceMins"],
-                        )
-                    elif f["filterType"] == "LOT_SIZE":
-                        min_ = trader.Quantity(f["minQty"])
-                        max_ = trader.Quantity(f["maxQty"])
-                        step = trader.Quantity(f["stepSize"])
-                        limit_lot_size_filter = LotSizeFilter(
-                            min=min_ if min_ else None,
-                            max=max_ if max_ else None,
-                            step=step if step else None,
-                        )
-                    elif f["filterType"] == "MIN_NOTIONAL":
-                        limit_notional_value_filter = LimitNotionalValueFilter(
-                            min=trader.Quantity(f["minNotional"]),
-                        )
-                        if f["applyToMarket"]:
-                            market_notional_value_filter = MarketNotionalValueFilter(
-                                min=trader.Quantity(f["minNotional"]),
+                    min_: Optional[trader.Quantity]
+                    max_: Optional[trader.Quantity]
+                    step: Optional[trader.Quantity]
+
+                    for f in s["filters"]:
+                        if f["filterType"] == "PRICE_FILTER":
+                            min_p = trader.Price(f["minPrice"])
+                            max_p = trader.Price(f["maxPrice"])
+                            step_p = trader.Price(f["tickSize"])
+                            price_filter = PriceFilter(
+                                min=min_p if min_p else None,
+                                max=max_p if max_p else None,
+                                step=step_p if step_p else None,
+                            )
+                        elif f["filterType"] == "PERCENT_PRICE":
+                            percent_price_filter = PercentPriceFilter(
+                                multiplier_up=trader.Price(f["multiplierUp"]),
+                                multiplier_down=trader.Price(f["multiplierDown"]),
                                 window_minutes=f["avgPriceMins"],
                             )
-                    elif f["filterType"] == "MARKET_LOT_SIZE":
-                        market_lot_size_filter = LotSizeFilter(
-                            min=trader.Quantity(f["minQty"]),
-                            max=trader.Quantity(f["maxQty"]),
-                            step=trader.Quantity(f["stepSize"]),
-                        )
-                    elif f["filterType"] == "MAX_NUM_ORDERS":
-                        max_orders = f["maxNumOrders"]
-                    elif f["filterType"] == "MAX_POSITION":
-                        max_position = trader.Quantity(f["maxPosition"])
+                        elif f["filterType"] == "LOT_SIZE":
+                            min_ = trader.Quantity(f["minQty"])
+                            max_ = trader.Quantity(f["maxQty"])
+                            step = trader.Quantity(f["stepSize"])
+                            limit_lot_size_filter = LotSizeFilter(
+                                min=min_ if min_ else None,
+                                max=max_ if max_ else None,
+                                step=step if step else None,
+                            )
+                        elif f["filterType"] == "MIN_NOTIONAL":
+                            limit_notional_value_filter = LimitNotionalValueFilter(
+                                min=trader.Quantity(f["minNotional"]),
+                            )
+                            if f["applyToMarket"]:
+                                market_notional_value_filter = MarketNotionalValueFilter(
+                                    min=trader.Quantity(f["minNotional"]),
+                                    window_minutes=f["avgPriceMins"],
+                                )
+                        elif f["filterType"] == "MARKET_LOT_SIZE":
+                            market_lot_size_filter = LotSizeFilter(
+                                min=trader.Quantity(f["minQty"]),
+                                max=trader.Quantity(f["maxQty"]),
+                                step=trader.Quantity(f["stepSize"]),
+                            )
+                        elif f["filterType"] == "MAX_NUM_ORDERS":
+                            max_orders = f["maxNumOrders"]
+                        elif f["filterType"] == "MAX_POSITION":
+                            max_position = trader.Quantity(f["maxPosition"])
 
-                if limit_lot_size_filter and market_lot_size_filter:
-                    a = limit_lot_size_filter
-                    b = market_lot_size_filter
-                    assert a is not None and b is not None
+                    if limit_lot_size_filter and market_lot_size_filter:
+                        a = limit_lot_size_filter
+                        b = market_lot_size_filter
+                        assert a is not None and b is not None
 
-                    if a.min and b.min:
-                        min_ = max(a.min, b.min)
-                    elif a.min:
-                        min_ = a.min
-                    else:
-                        min_ = None
+                        if a.min and b.min:
+                            min_ = max(a.min, b.min)
+                        elif a.min:
+                            min_ = a.min
+                        else:
+                            min_ = None
 
-                    if a.max and b.max:
-                        max_ = min(a.max, b.max)
-                    elif a.max:
-                        max_ = a.max
-                    else:
-                        max_ = None
+                        if a.max and b.max:
+                            max_ = min(a.max, b.max)
+                        elif a.max:
+                            max_ = a.max
+                        else:
+                            max_ = None
 
-                    if a.step and b.step:
-                        step = max(a.step, b.step)
-                        assert step % a.step == 0 and step % b.step == 0
-                        step = step
-                    elif a.step:
-                        step = a.step
-                    else:
-                        step = None
+                        if a.step and b.step:
+                            step = max(a.step, b.step)
+                            assert step % a.step == 0 and step % b.step == 0
+                            step = step
+                        elif a.step:
+                            step = a.step
+                        else:
+                            step = None
 
-                    market_lot_size_filter = LotSizeFilter(min_, max_, step)
+                        market_lot_size_filter = LotSizeFilter(min_, max_, step)
 
-                self.symbol_info[s["symbol"]] = SymbolInfo(
-                    base=s["baseAsset"],
-                    quote=s["quoteAsset"],
-                    base_precision=s["baseAssetPrecision"],
-                    quote_precision=s["quoteAssetPrecision"],
-                    max_orders=max_orders,
-                    max_position=max_position,
-                    price_filter=price_filter,
-                    percent_price_filter=percent_price_filter,
-                    limit_lot_size_filter=limit_lot_size_filter,
-                    limit_notional_value_filter=limit_notional_value_filter,
-                    market_lot_size_filter=market_lot_size_filter,
-                    market_notional_value_filter=market_notional_value_filter,
-                )
+                    self.symbol_info[s["symbol"]] = SymbolInfo(
+                        base=s["baseAsset"],
+                        quote=s["quoteAsset"],
+                        base_precision=s["baseAssetPrecision"],
+                        quote_precision=s["quoteAssetPrecision"],
+                        max_orders=max_orders,
+                        max_position=max_position,
+                        price_filter=price_filter,
+                        percent_price_filter=percent_price_filter,
+                        limit_lot_size_filter=limit_lot_size_filter,
+                        limit_notional_value_filter=limit_notional_value_filter,
+                        market_lot_size_filter=market_lot_size_filter,
+                        market_notional_value_filter=market_notional_value_filter,
+                    )
 
-                self.symbols[s["baseAsset"], s["quoteAsset"]] = s["symbol"]
+                    self.symbols[s["baseAsset"], s["quoteAsset"]] = s["symbol"]
 
-            self.symbols_last_fetched = now()
-        return self.symbols
+                self.symbols_last_fetched = now()
+            return self.symbols
 
     async def binance_rest(
         self,

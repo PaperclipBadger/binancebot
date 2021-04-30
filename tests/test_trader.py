@@ -1,4 +1,4 @@
-from typing import Dict, Mapping, Tuple
+from typing import Dict, List, Mapping, Tuple
 
 import decimal
 
@@ -23,6 +23,25 @@ class PlatonicMarket(trader.TradingClient):
 
     async def get_price(self, base: trader.Asset, quote: trader.Asset) -> trader.Price:
         return self.prices[base, quote]
+
+    async def apply_market_filters(
+        self,
+        base: trader.Asset,
+        quote: trader.Asset,
+        *,
+        base_quantity: trader.Quantity = None,
+        quote_quantity: trader.Quantity = None,
+    ) -> List[trader.MarketOrder]:
+        return [trader.MarketOrder(base, quote, base_quantity, quote_quantity)]
+
+    async def apply_limit_filters(
+        self,
+        base: trader.Asset,
+        quote: trader.Asset,
+        price: trader.Price,
+        base_quantity: trader.Quantity,
+    ) -> List[trader.LimitOrder]:
+        return [trader.LimitOrder(base, quote, price, base_quantity)]
 
     async def buy_at_market(
         self,

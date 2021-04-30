@@ -27,7 +27,9 @@ async def periodic(period: float, task: Callable[[], Awaitable]):
     for i in itertools.count(1):
         now = loop.time()
         delta = max(start + i * period - now, 0.0)
-        await asyncio.gather(task(), asyncio.sleep(delta))
+        await asyncio.gather(
+            suppress(BaseException, task()), asyncio.sleep(delta)
+        )
 
 
 API_BASE = "https://api.binance.com"

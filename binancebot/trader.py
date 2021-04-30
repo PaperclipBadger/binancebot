@@ -1,9 +1,9 @@
-from typing import Mapping, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import asyncio
-import enum
 import dataclasses
 import decimal
+import enum
 import logging
 import math
 
@@ -44,6 +44,22 @@ class ExecutedOrder:
         return sum(fill.quote_quantity for fill in self.fills)
 
 
+@dataclasses.dataclass(frozen=True)
+class MarketOrder:
+    base: Asset
+    quote: Asset
+    base_quantity: Optional[Quantity] = None
+    quote_quantity: Optional[Quantity] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class LimitOrder:
+    base: Asset
+    quote: Asset
+    price: Price
+    base_quantity: Quantity
+
+
 class OrderError(ValueError):
     pass
 
@@ -53,6 +69,25 @@ class TradingClient:
         ...
 
     async def get_price(self, base: Asset, quote: Asset) -> Price:
+        ...
+
+    async def apply_market_filters(
+        self,
+        base: Asset,
+        quote: Asset,
+        *,
+        base_quantity: Quantity = None,
+        quote_quantity: Quantity = None,
+    ) -> List[MarketOrder]:
+        ...
+
+    async def apply_limit_filters(
+        self,
+        base: Asset,
+        quote: Asset,
+        price: Price,
+        base_quantity: Quantity,
+    ) -> List[LimitOrder]:
         ...
 
     async def buy_at_market(
@@ -93,7 +128,7 @@ async def rebalance(
     assert abs(sum(target.values()) - 1.0) < 1.e-12
 
     holdings = dict(await client.get_holdings())
-    logger.info(f"holdings: {holdings}")
+    logger.debug(f"holdings: {holdings}")
     base_assets = set(target) | set(holdings) | set(minima)
 
     pairs = [
@@ -137,7 +172,7 @@ async def rebalance(
         for k, v in values.items()
     }
 
-    logger.info(f"current distribution: {', '.join('{}={:.3f}'.format(k, v) for k, v in distribution.items())}")
+    logger.debug(f"current distribution: {', '.join('{}={:.3f}'.format(k, v) for k, v in distribution.items())}")
 
     unreserved_assets = set(target)
     unreserved_sum = 1.0
@@ -175,8 +210,10 @@ async def rebalance(
         else:
             assert False, "inconceivable!"
 
-    # list of triples (q, b, a) meaning sell q of your b for a
-    trades = []
+    # entry b: q means sell q of your b for quote asset
+    sells: Dict[Asset, Quantity] = {}
+    # entry a: q means buy q of a with quote asset
+    buys: Dict[Asset, Quantity] = {}
 
     # sorted list of assets by how badly misallocated they are
     by_allocation = sorted(zip(map(delta, distribution), distribution))
@@ -189,6 +226,17 @@ async def rebalance(
     # since at every step of the loop we balance some asset.
     log_threshold = math.log(threshold)
 
+    for _, asset in by_allocation:
+        logger.debug(
+            f"asset: {asset}"
+            f", holdings: {holdings[asset]}"
+            f", value: {values[asset]}"
+            f", distribution: {distribution[asset]}"
+        )
+
+    holdings_ = holdings
+    distribution_ = distribution
+
     while by_allocation[0][0] < -log_threshold or by_allocation[-1][0] > log_threshold:
         _, under = by_allocation[0]
         _, over = by_allocation[-1]
@@ -198,9 +246,26 @@ async def rebalance(
             distribution[over] - decimal.Decimal(target.get(over, 0)),
         )
         over_quantity = holdings[over] * (recovered / distribution[over])
-        under_quantity = over_quantity * get_price(under, over)
+        under_quantity = over_quantity * get_price(over, under)
 
-        trades.append((over_quantity, over, under))
+        logger.debug(f"{over=}, {under=}")
+        logger.debug(f"{over_quantity=}")
+        logger.debug(f"{under_quantity=}")
+        logger.debug(f"{get_price(under, over)=}")
+
+        # do all trading via a quote asset, so we don't use any low-liquidity altcoin markets
+        assert under != over
+        if under == quote_asset:
+            sells.setdefault(over, Quantity(0))
+            sells[over] += over_quantity
+        elif over == quote_asset:
+            buys.setdefault(under, Quantity(0))
+            buys[under] += under_quantity
+        else:
+            sells.setdefault(over, Quantity(0))
+            sells[over] += over_quantity
+            buys.setdefault(under, Quantity(0))
+            buys[under] += under_quantity
 
         assert over_quantity <= holdings[over]
         holdings[over] -= over_quantity
@@ -214,27 +279,109 @@ async def rebalance(
         by_allocation[-1] = delta(over), over
         by_allocation.sort()  # timsort, don't fail me now
 
-    # gather together like trades
-    results = await asyncio.gather(
+    logger.debug(f"planned sells: {sells}")
+    logger.debug(f"planned buys: {buys}")
+    logger.debug(f"holdings after planned trades: {holdings}")
+    logger.debug(f"distribution after planned trades: {distribution}")
+
+    holdings = holdings_
+    distribution = distribution_
+
+    # convert planned trades into legal trades
+    real_sellss: List[List[MarketOrder]]
+    real_buyss: List[List[MarketOrder]]
+    real_sellss, real_buyss = await asyncio.gather(
+        asyncio.gather(
+            *(
+                client.apply_market_filters(
+                    base=base_asset,
+                    quote=quote_asset,
+                    base_quantity=base_quantity,
+                )
+                for base_asset, base_quantity in sells.items()
+            ),
+        ),
+        asyncio.gather(
+            *(
+                client.apply_market_filters(
+                    base=base_asset,
+                    quote=quote_asset,
+                    base_quantity=base_quantity,
+                )
+                for base_asset, base_quantity in buys.items()
+            ),
+        ),
+    )
+
+    logger.debug(f"{real_sellss=}")
+    logger.debug(f"{real_buyss=}")
+
+    holdings_ = holdings
+
+    # dry run the real trades and check that we have sufficient funds
+    for real_sells in real_sellss:
+        for sell in real_sells:
+            assert sell.base_quantity is not None
+            assert sell.quote_quantity is None
+            quote_quantity = sell.base_quantity * get_price(sell.base, sell.quote)
+
+            assert holdings[sell.base] >= sell.base_quantity, \
+                    f"base holdings {holdings[sell.base]} should be greater than {sell.base_quantity}"  # noqa: E127
+            holdings[sell.base] -= sell.base_quantity
+            holdings[sell.quote] += quote_quantity
+    for real_buys in real_buyss:
+        for buy in real_buys:
+            assert buy.base_quantity is not None
+            assert buy.quote_quantity is None
+            quote_quantity = buy.base_quantity * get_price(buy.base, buy.quote)
+
+            assert holdings[buy.quote] >= quote_quantity, \
+                    f"quote holdings {holdings[buy.quote]} should be greater than {quote_quantity}"  # noqa: E127
+            holdings[buy.base] += buy.base_quantity
+            holdings[buy.quote] -= quote_quantity
+
+    for real_sells in real_sellss:
+        for sell in real_sells:
+            logger.info(f"selling {sell.base_quantity} {sell.base} for {sell.quote}")
+
+    sell_results = await asyncio.gather(
         *(
-            buy_via(sell, buy, quote_asset, base_quantity, client)
-            for base_quantity, sell, buy in trades
+            client.sell_at_market(**dataclasses.asdict(sell))
+            for real_sells in real_sellss
+            for sell in real_sells
         ),
         return_exceptions=True,
     )
 
-    for r in results:
+    for r in sell_results:
+        if isinstance(r, BaseException):
+            logger.error(f"{r.__class__.__name__}: {r}")
+
+    for real_buys in real_buyss:
+        for buy in real_buys:
+            logger.info(f"buying {buy.base_quantity} {buy.base} with {buy.quote}")
+
+    buy_results = await asyncio.gather(
+        *(
+            client.buy_at_market(**dataclasses.asdict(buy))
+            for real_buys in real_buyss
+            for buy in real_buys
+        ),
+        return_exceptions=True,
+    )
+
+    for r in buy_results:
         if isinstance(r, BaseException):
             logger.error(f"{r.__class__.__name__}: {r}")
 
 
 # do all trading via a quote asset, so we don't use any low-liquidity altcoin markets
-async def buy_via(base, quote, via, base_quantity, client) -> None:
+async def sell_via(base, quote, via, base_quantity, client) -> None:
     assert base != quote
+    logger.info(f"trading {base_quantity} {base} for {quote} via {via}")
 
     if base == via:
         logger.debug("base==via, direct trade")
-        logger.info(f"trading {base_quantity} {base} for {quote}")
         await client.buy_at_market(
             quote,
             base,
@@ -242,7 +389,6 @@ async def buy_via(base, quote, via, base_quantity, client) -> None:
         )
     elif via == quote:
         logger.debug("via==quote, direct trade")
-        logger.info(f"trading {base_quantity} {base} for {quote}")
         await client.sell_at_market(
             base,
             quote,
