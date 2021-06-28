@@ -58,6 +58,35 @@ class OrderStatus(enum.Enum):
         return self in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)
 
 
+class Interval(enum.Enum):
+    ONE_MINUTE = "1m"
+    THREE_MINUTES = "3m"
+    FIVE_MINUTES = "5m"
+    FIFTEEN_MINUTES = "15m"
+    THIRTY_MINUTES = "30m"
+    ONE_HOUR = "1h"
+    TWO_HOURS = "2h"
+    FOUR_HOURS = "4h"
+    SIX_HOURS = "6h"
+    EIGHT_HOURS = "8h"
+    TWELVE_HOURS = "12h"
+    ONE_DAY = "1d"
+    THREE_DAYS = "3d"
+    ONE_WEEK = "1w"
+    ONE_MONTH = "1M"
+
+    @property
+    def milliseconds(self) -> int:
+        table = {
+            "m": 60 * 1000,
+            "h": 60 * 60 * 1000,
+            "d": 24 * 60 * 60 * 1000,
+            "w": 7 * 24 * 60 * 60 * 1000,
+            "M": 30 * 7 * 24 * 60 * 60 * 1000,
+        }
+        return int(self.value[:-1]) * table[self.value[-1]]
+
+
 @dataclasses.dataclass
 class Candlestick:
     open_time: Timestamp
@@ -178,6 +207,10 @@ class BinanceClient(trader.TradingClient):
             if trader.Quantity(balance["free"]) + trader.Quantity(balance["locked"]) > 0
         }
 
+    async def get_commission(self) -> float:
+        response_json = await self.binance_rest("/api/v3/account", signed=True)
+        return response_json["takerCommission"] / 10000
+
     async def get_price(self, base: trader.Asset, quote: trader.Asset) -> trader.Price:
         symbol = await self.get_symbol(base, quote)
         response_json = await self.binance_rest("/api/v3/avgPrice", params={"symbol": symbol})
@@ -257,7 +290,7 @@ class BinanceClient(trader.TradingClient):
                     base=base,
                     quote=quote,
                     quote_quantity=round(
-                        (split / quantity) * quote_quantity,
+                        split * market_price,
                         symbol_info.quote_precision,
                     ),
                 )
@@ -517,8 +550,12 @@ class BinanceClient(trader.TradingClient):
             asks=[AskOrder(a, b) for a, b in response_json["asks"]],
         )
 
-    async def get_candlesticks(self, base: trader.Asset, quote: trader.Asset, period_ms: int) -> List[Candlestick]:
+    async def get_candlesticks(
+        self, base: trader.Asset, quote: trader.Asset, period_ms: int, interval: Interval = Interval.ONE_MINUTE,
+    ) -> List[Candlestick]:
         """Get recent aggregate price data for an asset pair."""
+        assert period_ms <= 1000 * interval.milliseconds, (period_ms, interval)
+
         symbol = await self.get_symbol(base, quote)
 
         endTime = now()
@@ -528,14 +565,14 @@ class BinanceClient(trader.TradingClient):
             "/api/v3/klines",
             params=dict(
                 symbol=symbol,
-                interval="1m",
+                interval=interval.value,
                 startTime=startTime,
                 endTime=endTime,
                 limit=1000
             ),
         )
 
-        return [
+        candlesticks = [
             Candlestick(
                 open_time=c[0],
                 open=trader.Price(c[1]),
@@ -547,10 +584,14 @@ class BinanceClient(trader.TradingClient):
             )
             for c in response_json
         ]
+        candlesticks.sort(key=lambda c: c.open_time)
+        return candlesticks
 
-    async def get_vwap(self, base: trader.Asset, quote: trader.Asset, period_ms: int) -> trader.Price:
+    async def get_vwap(
+        self, base: trader.Asset, quote: trader.Asset, period_ms: int, interval: Interval
+    ) -> trader.Price:
         """Find the volume weighted average price using candlestick data."""
-        candlesticks = await self.get_candlesticks(base, quote, period_ms)
+        candlesticks = await self.get_candlesticks(base, quote, period_ms, interval)
         assert candlesticks
 
         # numerically stable rolling weighted mean
@@ -583,7 +624,7 @@ class BinanceClient(trader.TradingClient):
             if not self.symbols or now() - self.symbols_last_fetched > 3_600_000:
                 response_json = await self.binance_rest("/api/v3/exchangeInfo")
 
-                logger.info(f"exchange time: {response_json['serverTime']} bot time: {now()}")
+                logger.info(f"exchange time: {response_json['serverTime']} bot time: {(now_:=now())} diff: {now_ - response_json['serverTime']}")
 
                 self.symbol_info = {}
                 self.symbols = {}

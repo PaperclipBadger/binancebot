@@ -4,8 +4,8 @@ import asyncio
 import dataclasses
 import decimal
 import enum
+import itertools
 import logging
-import math
 
 
 logger = logging.getLogger(__name__)
@@ -136,7 +136,12 @@ async def rebalance(
         for base in base_assets
         for quote in (quote_asset, value_asset)
         if base != quote
+        if base != value_asset
     ]
+
+    if value_asset in base_assets and (quote_asset, value_asset) not in pairs:
+        pairs.append((quote_asset, value_asset))
+
     prices = await asyncio.gather(*(client.get_price(base, quote) for base, quote in pairs))
     market = {pair: price for pair, price in zip(pairs, prices)}
 
@@ -196,19 +201,8 @@ async def rebalance(
     target = target_
 
     def delta(k: Asset) -> float:
-        has_holdings = distribution[k] > 0
-        has_target = k in target
-        if has_holdings and has_target:
-            return math.log(distribution[k]) - math.log(target.get(k, 0))
-        elif has_holdings and not has_target:
-            # if no target is set then target is implicitly zero
-            return float("inf")
-        elif not has_holdings and has_target:
-            return float("-inf")
-        elif not has_holdings and not has_target:
-            return 0.0
-        else:
-            assert False, "inconceivable!"
+        # we once did this in log space, but it works poorly for small values
+        return float(distribution.get(k, 0.0)) - target.get(k, 0.0)
 
     # entry b: q means sell q of your b for quote asset
     sells: Dict[Asset, Quantity] = {}
@@ -224,20 +218,18 @@ async def rebalance(
     # become perfectly represented.
     # This way we rebalance using at most len(holdings) + len(target) trades,
     # since at every step of the loop we balance some asset.
-    log_threshold = math.log(threshold)
-
     for _, asset in by_allocation:
         logger.debug(
             f"asset: {asset}"
-            f", holdings: {holdings[asset]}"
+            f", holdings: {holdings.get(asset, Quantity(0))}"
             f", value: {values[asset]}"
             f", distribution: {distribution[asset]}"
         )
 
-    holdings_ = holdings
-    distribution_ = distribution
+    holdings_ = holdings.copy()
+    distribution_ = distribution.copy()
 
-    while by_allocation[0][0] < -log_threshold or by_allocation[-1][0] > log_threshold:
+    while by_allocation[0][0] < -threshold or by_allocation[-1][0] > threshold:
         _, under = by_allocation[0]
         _, over = by_allocation[-1]
 
@@ -293,20 +285,36 @@ async def rebalance(
     real_sellss, real_buyss = await asyncio.gather(
         asyncio.gather(
             *(
-                client.apply_market_filters(
-                    base=base_asset,
-                    quote=quote_asset,
-                    base_quantity=base_quantity,
+                (
+                    client.apply_market_filters(
+                        base=base_asset,
+                        quote=quote_asset,
+                        base_quantity=base_quantity,
+                    )
+                    if base_asset != value_asset
+                    else client.apply_market_filters(
+                        base=quote_asset,
+                        quote=value_asset,
+                        quote_quantity=base_quantity,
+                    )
                 )
                 for base_asset, base_quantity in sells.items()
             ),
         ),
         asyncio.gather(
             *(
-                client.apply_market_filters(
-                    base=base_asset,
-                    quote=quote_asset,
-                    base_quantity=base_quantity,
+                (
+                    client.apply_market_filters(
+                        base=base_asset,
+                        quote=quote_asset,
+                        base_quantity=base_quantity,
+                    )
+                    if base_asset != value_asset
+                    else client.apply_market_filters(
+                        base=quote_asset,
+                        quote=value_asset,
+                        quote_quantity=base_quantity,
+                    )
                 )
                 for base_asset, base_quantity in buys.items()
             ),
@@ -316,63 +324,134 @@ async def rebalance(
     logger.debug(f"{real_sellss=}")
     logger.debug(f"{real_buyss=}")
 
-    holdings_ = holdings
+    holdings_ = holdings.copy()
 
     # dry run the real trades and check that we have sufficient funds
-    for real_sells in real_sellss:
-        for sell in real_sells:
+    for sell in itertools.chain.from_iterable(real_sellss):
+        if sell.quote == quote_asset:
             assert sell.base_quantity is not None
             assert sell.quote_quantity is None
             quote_quantity = sell.base_quantity * get_price(sell.base, sell.quote)
 
-            assert holdings[sell.base] >= sell.base_quantity, \
-                    f"base holdings {holdings[sell.base]} should be greater than {sell.base_quantity}"  # noqa: E127
+            if holdings[sell.base] < sell.base_quantity:
+                logger.error(f"base holdings {holdings[sell.base]}{sell.base} should be greater than {sell.base_quantity}")  # noqa: E127
+
             holdings[sell.base] -= sell.base_quantity
+            holdings.setdefault(sell.quote, Quantity(0))
             holdings[sell.quote] += quote_quantity
-    for real_buys in real_buyss:
-        for buy in real_buys:
+        elif sell.quote == value_asset:
+            assert sell.base_quantity is None
+            assert sell.quote_quantity is not None
+            base_quantity = sell.quote_quantity * get_price(sell.quote, sell.base)
+
+            if holdings[sell.quote] < sell.quote_quantity:
+                logger.error(f"quote holdings {holdings[sell.quote]}{sell.quote} should be greater than {sell.quote_quantity}")  # noqa: E127
+
+            holdings.setdefault(sell.base, Quantity(0))
+            holdings[sell.base] += base_quantity
+            holdings[sell.quote] -= sell.quote_quantity
+        else:
+            raise RuntimeError("Inconceivable!")
+
+    for buy in itertools.chain.from_iterable(real_buyss):
+        if buy.quote == quote_asset:
             assert buy.base_quantity is not None
             assert buy.quote_quantity is None
             quote_quantity = buy.base_quantity * get_price(buy.base, buy.quote)
 
-            assert holdings[buy.quote] >= quote_quantity, \
-                    f"quote holdings {holdings[buy.quote]} should be greater than {quote_quantity}"  # noqa: E127
+            if holdings[buy.quote] < quote_quantity:
+                logger.error(f"quote holdings {holdings[buy.quote]}{buy.quote} should be greater than {quote_quantity}")  # noqa: E127
+
+            holdings.setdefault(buy.base, Quantity(0))
             holdings[buy.base] += buy.base_quantity
             holdings[buy.quote] -= quote_quantity
+        elif buy.quote == value_asset:
+            assert buy.base_quantity is None
+            assert buy.quote_quantity is not None
+            base_quantity = buy.quote_quantity * get_price(buy.quote, buy.base)
 
-    for real_sells in real_sellss:
-        for sell in real_sells:
+            if holdings[buy.base] < base_quantity:
+                logger.error(f"base holdings {holdings[buy.base]}{buy.base} should be greater than {base_quantity}")  # noqa: E127
+
+            holdings[buy.base] -= base_quantity
+            holdings.setdefault(buy.quote, Quantity(0))
+            holdings[buy.quote] += buy.quote_quantity
+        else:
+            raise RuntimeError("Inconceivable!")
+
+    # do the trades!
+
+    for sell in itertools.chain.from_iterable(real_sellss):
+        if sell.quote == quote_asset:
             logger.info(f"selling {sell.base_quantity} {sell.base} for {sell.quote}")
+        elif sell.quote == value_asset:
+            logger.info(f"buying {sell.base} with {sell.quote_quantity} {sell.quote}")
+        else:
+            raise RuntimeError("Inconceivable!")
 
     sell_results = await asyncio.gather(
         *(
-            client.sell_at_market(**dataclasses.asdict(sell))
+            (
+                client.sell_at_market(**dataclasses.asdict(sell))
+                if sell.quote != value_asset
+                else client.buy_at_market(**dataclasses.asdict(sell))
+            )
             for real_sells in real_sellss
             for sell in real_sells
         ),
         return_exceptions=True,
     )
 
-    for r in sell_results:
+    for r, sell in zip(sell_results, itertools.chain.from_iterable(real_sellss)):
         if isinstance(r, BaseException):
-            logger.error(f"{r.__class__.__name__}: {r}")
+            if sell.quote == quote_asset:
+                logger.error(
+                    f"Error selling {sell.base_quantity} {sell.base} for {sell.quote}:"
+                    f" {r.__class__.__name__}: {r}"
+                )
+            elif sell.quote == value_asset:
+                logger.error(
+                    f"Error buying {sell.base} with {sell.quote_quantity} {sell.quote}:"
+                    f" {r.__class__.__name__}: {r}"
+                )
+            else:
+                raise RuntimeError("Inconceivable!")
 
-    for real_buys in real_buyss:
-        for buy in real_buys:
+    for buy in itertools.chain.from_iterable(real_buyss):
+        if buy.quote == quote_asset:
             logger.info(f"buying {buy.base_quantity} {buy.base} with {buy.quote}")
+        elif buy.quote == value_asset:
+            logger.info(f"selling {buy.base} for {buy.quote_quantity} {buy.quote}")
+        else:
+            raise RuntimeError("Inconceivable!")
 
     buy_results = await asyncio.gather(
         *(
-            client.buy_at_market(**dataclasses.asdict(buy))
+            (
+                client.buy_at_market(**dataclasses.asdict(buy))
+                if buy.quote != value_asset
+                else client.sell_at_market(**dataclasses.asdict(buy))
+            )
             for real_buys in real_buyss
             for buy in real_buys
         ),
         return_exceptions=True,
     )
 
-    for r in buy_results:
+    for r, buy in zip(buy_results, itertools.chain.from_iterable(real_buyss)):
         if isinstance(r, BaseException):
-            logger.error(f"{r.__class__.__name__}: {r}")
+            if buy.quote == quote_asset:
+                logger.error(
+                    f"Error buying {buy.base_quantity} {buy.base} with {buy.quote}:"
+                    f" {r.__class__.__name__}: {r}"
+                )
+            elif buy.quote == value_asset:
+                logger.error(
+                    f"Error selling {buy.base} for {buy.quote_quantity} {buy.quote}:"
+                    f" {r.__class__.__name__}: {r}"
+                )
+            else:
+                raise RuntimeError("Inconceivable!")
 
 
 # do all trading via a quote asset, so we don't use any low-liquidity altcoin markets

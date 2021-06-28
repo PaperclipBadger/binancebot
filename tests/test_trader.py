@@ -164,7 +164,7 @@ class PlatonicMarket(trader.TradingClient):
             ],
         )
 
-        print("BUY", executed_quantity, base, "for", cumulative_quote_quantity, quote)
+        print("BUY", executed_quantity, base, "with", cumulative_quote_quantity, quote)
 
         return status
 
@@ -236,17 +236,19 @@ async def test_reblance() -> None:
     total = sum(values.values())
     distribution = {k: float(v / total) for k, v in values.items()}
 
-    assert all(d / target[k] < threshold for k, d in distribution.items())
-    assert all(target[k] / d < threshold for k, d in distribution.items())
+    assert all((d / target[k] if k in target else 1.0) < threshold for k, d in distribution.items()), distribution
+    assert all(target.get(k, 0.0) / d < threshold for k, d in distribution.items()), distribution
 
 
 @pytest.mark.asyncio
 async def test_reblance_with_minima() -> None:
+    initial_holdings = {
+        "BTC": trader.Quantity("100.00000000"),
+        "ETH": trader.Quantity("100.00000000"),
+    }
+
     market = PlatonicMarket(
-        holdings={
-            "BTC": trader.Quantity("100.00000000"),
-            "ETH": trader.Quantity("100.00000000"),
-        },
+        holdings=initial_holdings,
         prices={
             ("ETH", "BTC"): trader.Price("1.00000000"),
             ("BNB", "BTC"): trader.Price("0.50000000"),
@@ -280,6 +282,16 @@ async def test_reblance_with_minima() -> None:
 
     holdings = await market.get_holdings()
 
+    non_quote_assets = set(initial_holdings) | set(holdings)
+    non_quote_assets.remove(quote)
+
     for asset in minima:
-        expected = minima[asset] * decimal.Decimal(1 - 2 * market.commission)
-        assert holdings[asset] >= expected
+        if asset != quote:
+            # for most assets, worst case is two transfers
+            expected = minima[asset] * decimal.Decimal(1 - 2 * market.commission)
+            assert holdings[asset] >= expected, asset
+        else:
+            # for quote asset, we pay commission for every transfer in and out
+            # worst case is every other asset transfers in and out
+            expected = minima[asset] * decimal.Decimal(1 - 2 * len(non_quote_assets) * market.commission)
+            assert holdings[asset] >= expected, asset
