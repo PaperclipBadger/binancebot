@@ -21,11 +21,11 @@ Run the tests (such as they are) with ::
 Development
 -----------
 
-I use asyncio and httpx to parallelise request against the binance API,
+I use asyncio and httpx to parallelize requests against the binance API,
 so it'd be worth going over a tutorial for python async programming before making contributions.
 As far as I'm aware our use of the libraries is very straightforward.
 I also use mypy and extensive type annotations, which again it would be worth becoming familiar with.
-I use pre-commit_ to maintain code standards, and if you'd like to contribute you should to.
+I use pre-commit_ to maintain code standards, and if you'd like to contribute you should too.
 It'll autoformat your code and pick you up on trivial errors like missing imports
 and less trivial errors like type mismatches.
 
