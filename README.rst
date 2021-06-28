@@ -31,16 +31,16 @@ and less trivial errors like type mismatches.
 
 The project layout is fairly straightforwrd:
 
- - `binancebot.trader` defines an interface for a generic trading client,
+-  ``binancebot.trader`` defines an interface for a generic trading client,
    and contains the logic for making trades against it to keep a balanced portfolio.
    I've tried to keep this as generic as possible (mostly for clarity of thought),
    but some binance-specific stuff might have leaked anyway. I'm lazy.
- - `binancebot.binance` defines a client for the binance API that satisfies the interface.
- - `binancebot.__main__` loads the config, launches the client, sets up logging, etc.
+-  ``binancebot.binance`` defines a client for the binance API that satisfies the interface.
+-  ``binancebot.__main__`` loads the config, launches the client, sets up logging, etc.
    It also has a little bit of trading logic
    (setting the target distribution based on recent price movements)
    because I'm lazy.
- - `binancebot.server` defines a simple HTTP server that gives debug information about the bot.
+-  ``binancebot.server`` defines a simple HTTP server that gives debug information about the bot.
    At some point I'll extend this to give yet more useful information, and maybe even show some pretty graphs.
 
 .. _poetry: https://python-poetry.org/
