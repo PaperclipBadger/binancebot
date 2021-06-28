@@ -29,7 +29,7 @@ I use pre-commit_ to maintain code standards, and if you'd like to contribute yo
 It'll autoformat your code and pick you up on trivial errors like missing imports
 and less trivial errors like type mismatches.
 
-The project layout is fairly straightforwrd:
+The project layout is fairly straightforward:
 
 -  ``binancebot.trader`` defines an interface for a generic trading client,
    and contains the logic for making trades against it to keep a balanced portfolio.
