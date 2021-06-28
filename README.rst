@@ -6,7 +6,7 @@ Running the bot
 
 This project uses poetry_ for dependency and environment management.
 
-Copy the config template to e.g. config.toml and put your API keys in it.
+Copy the config template to e.g. ``config.toml`` and put your API keys in it.
 
 Then run the bot with ::
 
@@ -21,7 +21,7 @@ Run the tests (such as they are) with ::
 Development
 -----------
 
-I use asyncio and httpx to parallelize requests against the binance API,
+I use ``asyncio`` and ``httpx`` to parallelize requests against the binance API,
 so it'd be worth going over a tutorial for python async programming before making contributions.
 As far as I'm aware our use of the libraries is very straightforward.
 I also use mypy and extensive type annotations, which again it would be worth becoming familiar with.
