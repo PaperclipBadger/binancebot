@@ -43,5 +43,5 @@ The project layout is fairly straightforwrd:
  - `binancebot.server` defines a simple HTTP server that gives debug information about the bot.
    At some point I'll extend this to give yet more useful information, and maybe even show some pretty graphs.
 
-.. poetry: https://python-poetry.org/
-.. pre-commit: https://pre-commit.com/
+.. _poetry: https://python-poetry.org/
+.. _pre-commit: https://pre-commit.com/
