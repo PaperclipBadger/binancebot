@@ -128,6 +128,7 @@ async def rebalance(
     assert abs(sum(target.values()) - 1.0) < 1.e-12
 
     holdings = dict(await client.get_holdings())
+    del holdings["NFT"]  # hotfix: there are no NFT markets on binance
     logger.debug(f"holdings: {holdings}")
     base_assets = set(target) | set(holdings) | set(minima)
 

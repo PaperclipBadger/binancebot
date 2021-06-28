@@ -1,5 +1,6 @@
 from typing import Awaitable, Callable, Mapping, Optional, Protocol, Sequence, Tuple, Type, TypeVar
 
+import argparse
 import asyncio
 import itertools
 import logging
@@ -8,6 +9,7 @@ import traceback
 
 import httpx
 import numpy as np
+import toml
 
 from binancebot import binance, trader, server
 
@@ -64,7 +66,6 @@ async def target_distribution(
     client: binance.BinanceClient,
     period_ms: int,
     window: binance.Interval,
-    n_windows: int,
     beta: float,
 ) -> Mapping[trader.Asset, float]:
     """Weights assets higher based on the relative rate of change of their price."""
@@ -125,7 +126,6 @@ async def do_trading(
     quote_asset: trader.Asset,
     period_ms: int,
     window: binance.Interval,
-    n_windows: int,
     beta: float,
     threshold: float,
     client: binance.BinanceClient,
@@ -138,7 +138,6 @@ async def do_trading(
         client=client,
         period_ms=period_ms,
         window=window,
-        n_windows=n_windows,
         beta=beta,
     )
 
@@ -149,123 +148,45 @@ async def do_trading(
 
     await trader.rebalance(
         target=target,
-        minima=MINIMA,
-        value_asset=VALUE_ASSET,
-        quote_asset=QUOTE_ASSET,
-        threshold=THRESHOLD,
+        minima=minima,
+        value_asset=value_asset,
+        quote_asset=quote_asset,
+        threshold=threshold,
         client=trader_client,
     )
 
 
-API_BASE = "https://api.binance.com"
-API_KEY = "1LxUK4DDKBRKTftGryFicphhgnXSfZSGngJLTkpgF7nQMoHpJKWSlEcwDezaxoNY"
-SECRET_KEY = b"1xC6yn9paTsbHYQ9gNVjdzIIFADzUJD50ubjM3Ic4VS1mJwC4hpTRPpgqB6eaP2K"
-# API_BASE = "https://testnet.binance.vision"
-# API_KEY = "AAzcPjIao7mRjgfedz8yPgo42UjzgiUMbS2Xa8sDIdPwQ3nzAuqUvfJ7Dryycxd3"
-# SECRET_KEY = b"C12RUn34VFuj60yhLC4ogfuaPpcTonJ5sNrnRZgkvPi0e0HqT9MPj6QXipnSWFcg"
+parser = argparse.ArgumentParser()
+parser.add_argument("--config-file", default="config.toml")
+args = parser.parse_args()
 
-http_client = httpx.AsyncClient()
-trader_client = binance.BinanceClient(
-    api_base=API_BASE,
-    api_key=API_KEY,
-    secret_key=SECRET_KEY,
-    http_client=http_client,
-)
-
-VALUE_ASSET = "USDT"
-QUOTE_ASSET = "BTC"
-
-ASSETS = [
-    # Fiat (should be stable)
-    VALUE_ASSET,
-    # Bitcoin and friends
-    "BTC",
-    "BCH",
-    "LTC",
-    # Ethereum and competitors
-    "ETH",
-    "ETC",
-    "ADA",
-    "DOT",
-    "TRX",
-    # Privacy
-    "XMR",
-    "ZEC",
-    # Utility coins
-    "IOTA",
-    "FIL",
-    "LINK",
-    "BAT",
-    # Finance
-    "XRP",
-    "XLM",
-    "BNB",
-    "UNI",
-    "AAVE",
-    # Meme value
-    "DOGE",
-]
-
-# TARGET_DISTRIBUTION = {
-#     # Bitcoin and friends
-#     "BTC": 0.1,
-#     "BCH": 0.025,
-#     "LTC": 0.025,
-#     # Ethereum and competitors
-#     "ETH": 0.5,
-#     "ETC": 0.025,
-#     # "ADA": 0.025,
-#     "DOT": 0.025,
-#     # "TRX": 0.025,
-#     # Privacy
-#     "XMR": 0.1,
-#     # "ZEC": 0.025,
-#     # Utility coins
-#     # "IOTA"
-#     # "FIL": 0.0125,
-#     "LINK": 0.025,
-#     # "BAT": 0.0125,
-#     # Finance
-#     "XRP": 0.025,
-#     "XLM": 0.025,
-#     "BNB": 0.025,
-#     # "UNI": 0.0125,
-#     # "AAVE": 0.0125,
-#     # Meme value
-#     "DOGE": 0.1,
-# }
-
-MINIMA = {
-    # used to pay exchange fees
-    "BNB": trader.Quantity("0.1000000"),
-    # quote currency, need a margin to account for fees
-    "BTC": trader.Quantity("0.0010000"),
-    # also sometimes used as a quote currency
-    "USDT": trader.Quantity("30.00000000")
-}
-PERIOD_MS = binance.Interval.ONE_DAY.milliseconds
-WINDOW = binance.Interval.FIVE_MINUTES
-N_WINDOWS = 15
-BETA = 10.0
-THRESHOLD = 0.01
-UPDATE_PERIOD = 30.0
+with open(args.config_file) as f:
+    config = toml.load(f)
 
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
 
 formatter = logging.Formatter("%(asctime)s\t%(levelname)s\t%(name)s\t%(message)s")
 
-file_handler = logging.FileHandler("binancebot.log")
-file_handler.setLevel(logging.DEBUG)
+file_handler = logging.FileHandler(config.get("logging", {}).get("file", "binancebot.log"))
+file_handler.setLevel(getattr(logging, config.get("logging", {}).get("file_level", "debug").upper()))
 file_handler.setFormatter(formatter)
 root_logger.addHandler(file_handler)
 
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(getattr(logging, config.get("logging", {}).get("console_level", "info").upper()))
 console_handler.setFormatter(formatter)
 root_logger.addHandler(console_handler)
 
 root_logger.info("(re)started")
+
+http_client = httpx.AsyncClient()
+trader_client = binance.BinanceClient(
+    api_base=config["binance"]["api_base"],
+    api_key=config["binance"]["api_key"],
+    secret_key=config["binance"]["secret_key"].encode("ascii"),
+    http_client=http_client,
+)
 
 loop = asyncio.get_event_loop()
 
@@ -274,17 +195,16 @@ loop.create_task(debug_server.start("localhost", 8080))
 
 main = loop.create_task(
     periodic(
-        UPDATE_PERIOD,
+        config["trader"]["update_period_s"],
         lambda time, time_delta, step_count: do_trading(
-            assets=ASSETS,
-            minima=MINIMA,
-            value_asset=VALUE_ASSET,
-            quote_asset=QUOTE_ASSET,
-            threshold=THRESHOLD,
-            period_ms=PERIOD_MS,
-            beta=BETA,
-            window=WINDOW,
-            n_windows=N_WINDOWS,
+            assets=config["trader"]["traded_assets"],
+            minima={k: trader.Quantity(v) for k, v in config["trader"]["minima"].items()},
+            value_asset=config["trader"]["value_asset"],
+            quote_asset=config["trader"]["quote_asset"],
+            threshold=config["trader"]["threshold"],
+            period_ms=config["trader"]["history_window_ms"],
+            window=binance.Interval(config["trader"]["history_resolution"]),
+            beta=config["trader"]["beta"],
             client=trader_client,
             time=time,
             time_delta=time_delta,

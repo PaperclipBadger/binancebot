@@ -1,0 +1,56 @@
+[binance]
+api_base = "https://api.binance.com"
+api_key = "your-api-key-here"
+secret_key = "your-secret-key-here"
+
+[logging]
+file = "binancebot.log"
+file_level = "debug"
+console_level = "info"
+
+[trader]
+value_asset = "USDT"
+quote_asset = "BTC"
+traded_assets = [
+    # Fiat (should be stable)
+    "USDT",
+    # Bitcoin and friends
+    "BTC",
+    "BCH",
+    "LTC",
+    # Ethereum and competitors
+    "ETH",
+    "ETC",
+    "ADA",
+    "DOT",
+    "TRX",
+    # Privacy
+    "XMR",
+    "ZEC",
+    # Utility coins
+    "IOTA",
+    "FIL",
+    "LINK",
+    "BAT",
+    # Finance
+    "XRP",
+    "XLM",
+    "BNB",
+    "UNI",
+    "AAVE",
+    # Meme value
+    "DOGE",
+]
+threshold = 0.05
+update_period_s = 30.0
+history_window_ms = 172800000
+history_resolution = "15m"
+beta = 10.0
+
+[trader.minima]
+# used to pay exchange fees
+"BNB" = "0.1000000"
+# quote currency, need a margin to account for fees
+"BTC" = "0.0010000"
+# also sometimes used as a quote currency
+"USDT" = "30.00000000"
