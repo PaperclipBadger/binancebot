@@ -7,6 +7,8 @@ secret_key = "your-secret-key-here"
 file = "binancebot.log"
 file_level = "debug"
 console_level = "info"
+server_num = 100
+server_level = "info"
 
 [server]
 host = "localhost"

@@ -1,9 +1,10 @@
-from typing import Awaitable, Callable, Mapping, Optional, Protocol, Sequence, Tuple, Type, TypeVar
+from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol, Sequence, Tuple, Type, TypeVar
 
 import argparse
 import asyncio
 import itertools
 import logging
+import logging.handlers
 import math
 import traceback
 
@@ -168,7 +169,11 @@ root_logger.setLevel(logging.DEBUG)
 
 formatter = logging.Formatter("%(asctime)s\t%(levelname)s\t%(name)s\t%(message)s")
 
-file_handler = logging.FileHandler(config.get("logging", {}).get("file", "binancebot.log"))
+file_handler = logging.handlers.TimedRotatingFileHandler(
+    config.get("logging", {}).get("file", "binancebot.log"),
+    when="midnight",
+    backupCount=7,
+)
 file_handler.setLevel(getattr(logging, config.get("logging", {}).get("file_level", "debug").upper()))
 file_handler.setFormatter(formatter)
 root_logger.addHandler(file_handler)
@@ -177,6 +182,30 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(getattr(logging, config.get("logging", {}).get("console_level", "info").upper()))
 console_handler.setFormatter(formatter)
 root_logger.addHandler(console_handler)
+
+
+class ServerHandler(logging.handlers.QueueHandler):
+    def __init__(self, queue: server.RingBuffer):
+        logging.handlers.QueueHandler.__init__(self, queue)  # type: ignore
+
+    def prepare(self, record):
+        return dict(
+            time=record.asctime,
+            level=record.levelname,
+            name=record.name,
+            message=record.message,
+        )
+
+    def enqueue(self, record):
+        self.queue.push(record)
+
+
+server_buffer: server.RingBuffer[Any]
+server_buffer = server.RingBuffer(size=config.get("logging", {}).get("server_num", 100))
+server_handler = ServerHandler(server_buffer)
+server_handler.setLevel(getattr(logging, config.get("logging", {}).get("server_level", "info").upper()))
+server_handler.setFormatter(formatter)
+root_logger.addHandler(server_handler)
 
 root_logger.info("(re)started")
 
@@ -190,7 +219,7 @@ trader_client = binance.BinanceClient(
 
 loop = asyncio.get_event_loop()
 
-debug_server = server.DebugInfoServer(trader_client)
+debug_server = server.DebugInfoServer(trader_client, server_buffer)
 loop.create_task(debug_server.start(config["server"]["host"], config["server"]["port"]))
 
 main = loop.create_task(
