@@ -191,7 +191,7 @@ trader_client = binance.BinanceClient(
 loop = asyncio.get_event_loop()
 
 debug_server = server.DebugInfoServer(trader_client)
-loop.create_task(debug_server.start("localhost", 8080))
+loop.create_task(debug_server.start(config["server"]["host"], config["server"]["port"]))
 
 main = loop.create_task(
     periodic(

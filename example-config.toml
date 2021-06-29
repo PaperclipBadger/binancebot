@@ -8,6 +8,10 @@ file = "binancebot.log"
 file_level = "debug"
 console_level = "info"
 
+[server]
+host = "localhost"
+port = 5000
+
 [trader]
 value_asset = "USDT"
 quote_asset = "BTC"
