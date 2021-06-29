@@ -1,4 +1,4 @@
-from typing import Any, Iterator, List, TypeVar, Collection
+from typing import Any, Collection, Iterator, List, Reversible, TypeVar
 
 import decimal
 import itertools
@@ -20,7 +20,7 @@ class MyJSONEncoder(json.JSONEncoder):
 T = TypeVar("T")
 
 
-class RingBuffer(Collection[T]):
+class RingBuffer(Collection[T], Reversible[T]):
     def __init__(self, size: int) -> None:
         self.items: List[T] = []
         self.start_index = 0
@@ -31,6 +31,12 @@ class RingBuffer(Collection[T]):
 
     def __iter__(self) -> Iterator[T]:
         return itertools.chain(self.items[self.start_index:], self.items[:self.start_index])
+
+    def __reversed__(self) -> Iterator[T]:
+        return itertools.chain(
+            reversed(self.items[:self.start_index]),
+            reversed(self.items[self.start_index:]),
+        )
 
     def __len__(self) -> int:
         return len(self.items)
@@ -58,7 +64,7 @@ class DebugInfoServer:
                 dict(
                     message="everything is fine",
                     holdings=await self.trading_client.get_holdings(),
-                    logs=list(self.logs),
+                    logs=list(reversed(self.logs)),
                 ),
             ),
             content_type="application/json",
