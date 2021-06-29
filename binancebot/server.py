@@ -54,7 +54,7 @@ class DebugInfoServer:
 
     async def home(self, request: web.Request) -> web.Response:
         return web.Response(
-            text=MyJSONEncoder(sort_keys=True).encode(
+            text=MyJSONEncoder(sort_keys=True, indent=2).encode(
                 dict(
                     message="everything is fine",
                     holdings=await self.trading_client.get_holdings(),
